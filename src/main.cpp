@@ -1,55 +1,49 @@
 // CONTROLLER BAZIN APA 50000L
 
-// functions:
-// - read DS18B20 temperature sensors
-// - read Humidity sensor
-// - read Light sensor over Serial
-// - read Water level sensor using TOF over Serial
-// - read IO input states (e.g.,  Button state)
-// - read IO output states (e.g., Pump 1, Pump 2)
-// - send data over LoRa
-// - receive data over LoRa
-// - process received data (e.g., control pumps, override mode)
+// ——————————————————————————————————
+// 1) INCLUDES & DEFINES
+// ——————————————————————————————————
 
-// Global definitions
-#define LORA_WRITE_NUM_WRAPPED(id)   \
-  {                                  \
-    LoRa.write('<');                 \
-    char _buf[10];                   \
-    itoa(id, _buf, 10);              \
-    for (int _i = 0; _buf[_i]; _i++) \
-      LoRa.write(_buf[_i]);          \
-    LoRa.write('>');                 \
-  }
+// pin assignments
+#define DS18B20_PIN 7
+#define LED_PIN 15
+#define PUMP1_PIN 12
+#define PUMP2_PIN 11
+#define BTN_AUTO 10
+#define BTN_PUMP1 8
+#define BTN_PUMP2 9
+#define SECOND_SERIAL_RX 13
+#define SECOND_SERIAL_TX 14
+
+// wrap LoRa sender ID in “<ID>”
+#define LORA_WRITE_NUM_WRAPPED(id)                             \
+    {                                                          \
+        LoRa.write('<');                                       \
+        char _buf[10];                                         \
+        itoa(id, _buf, 10);                                    \
+        for (int _i = 0; _buf[_i]; _i++) LoRa.write(_buf[_i]); \
+        LoRa.write('>');                                       \
+    }
+
+// bit-flags
 #define BIT_ON 1
 #define BIT_OFF 0
 
 #include <Arduino.h>
-#include <SX126x.h>
-
-#include <FastLED.h>
-#include <OneWire.h>
 #include <DallasTemperature.h>
 #include <EEPROM.h>
-
-#include "structures.h"
-#include <TaskScheduler.h>
+#include <FastLED.h>
+#include <OneWire.h>
+#include <SX126x.h>
 #include <SoftwareSerial.h>
-#include "controller.hpp"
+#include <TaskScheduler.h>
+#include <math.h> // for log()
+
 #include "IndicatControll.hpp"
-
-SX126x LoRa;
-
-// === Pins ===
-#define DS18B20_PIN 7 // Change if needed
-
-SoftwareSerial mySerial(13, 14); // RX, TX
-
-#define myID 100
-#define secondNodeID 101
-#define GatewayID 3
-
-uint8_t currentPacketID = 1;
+#include "StorageConfig.hpp"
+#include "controller.hpp"
+#include "hardware/watchdog.h"
+#include "structures.h"
 
 // LoRa Pin Configuration
 const int8_t NSS_PIN = 1;
@@ -59,401 +53,519 @@ const int8_t IRQ_PIN = 6;
 const int8_t TXEN_PIN = -1;
 const int8_t RXEN_PIN = -1;
 
-// DS18B20 Configuration
+// node IDs
+#define myID 101
+#define secondNodeID 102
+#define GatewayID 100
+
+// Task intervals (ms)
+#define getSensorDataInterval 10000
+#define printDataInterval 30000
+#define sendLoRaDataInterval 20000
+
+// ——————————————————————————————————
+// 2) FORWARD DECLARATIONS
+// ——————————————————————————————————
+void setup();
+void loop();
+
+void ReadSerialData();
+void processSerialInput(const String &data);
+void resetMySerial();
+
+void ReadMainSerialData();
+void processMainSerialInput(const String &cmd);
+
+void getSensorData();
+void printSensorData();
+
+void sendLoRaData();
+void readLoraPacket();
+void processReceivedData();
+void resetLoRaRequest();
+
+void printByteBinary(uint8_t val);
+void printDataPacket(const DataPacket &packet);
+
+// ——————————————————————————————————
+// 3) GLOBAL OBJECTS & STATE
+// ——————————————————————————————————
+SX126x LoRa;
+SoftwareSerial mySerial(SECOND_SERIAL_RX, SECOND_SERIAL_TX);
+
 OneWire oneWire(DS18B20_PIN);
 DallasTemperature ds18b20(&oneWire);
-DeviceAddress sensorAddresses[5]; // Supports up to 5 DS18B20 sensors
-int ds18b20Count = 0;
-#define EEPROM_ADDR 0 // EEPROM address to store sensor data
 
-// Global instance
+// up to 5 DS18B20 sensors
+DeviceAddress sensorAddresses[5];
+int ds18b20Count = 0;
+
 DataPacket LocalDataStruct;
 DataPacket receivedData;
+bool do_processReceivedData = false;
 
 bool dataWasMeasured = false;
-float ds18b20_temps[5];
 
 String inputString = "";
-int waterLevelSerial = 0;  // Water level sensor value
-int TemperatureSerial = 0; // Temperature sensor value
-char b[16];
-byte j;
+String mainInputString = "";
+bool mainInputComplete = false;
+unsigned long lastSerialReceiveTime = 0;
+const unsigned long serialTimeout = 5000;
 
-unsigned long lastSerialReceiveTime = 0;  // Timestamp of the last received data
-const unsigned long serialTimeout = 5000; //
+uint8_t currentPacketID = 1;
 
-void printDataPacket(const DataPacket &packet);
-void getSensorData();
-void readLoraPacket();
-void sendLoRaData();
-void printSensorData();
-void processSerialInput(String data);
-void ReadSerialData();
-
-// Task to read sensor data
-#define getSensorDataInterval 10000
+// Scheduler + tasks
+Scheduler runner;
 Task T_get_sensor_data(getSensorDataInterval, TASK_FOREVER, &getSensorData);
-
-// Task to print data to serial
-#define printDataInterval 30000
 Task T_print_sensor_data(printDataInterval, TASK_FOREVER, &printSensorData);
-
-#define sendLoRaDataInterval 20000
 Task T_send_lora_data(sendLoRaDataInterval, TASK_FOREVER, &sendLoRaData);
 
-Scheduler runner;
+// ——————————————————————————————————
+// 4) ARDUINO LIFECYCLE
+// ——————————————————————————————————
+void setup() {
+    // USB-serial
+    Serial.begin(115200);
+    // while (!Serial)
+    //   ; // wait for USB
 
-void setup()
-{
-  mySerial.begin(9600);
-  SPI.setRX(0);
-  SPI.setCS(1);
-  SPI.setSCK(2);
-  SPI.setTX(3);
-  SPI.begin();
+    // 1) initialize & load stored status + threshold
+    StorageConfig::begin();
+    LocalDataStruct.status = StorageConfig::loadStatus();
+    PumpControl::setWaterLevelThreshold(StorageConfig::loadThreshold());
 
-  Serial.begin(115200);
+    // initialize pumps & buttons
+    PumpControl::begin();
+    PumpControl::updatelocalstates(LocalDataStruct);
+    // initialize LED indicator
+    IndicatorControl::begin();
 
-  unsigned long start = millis();
-  while (!Serial && millis() - start < 8000)
-    ; // Wait max 3 seconds
+    // serial for external sensors
+    mySerial.begin(9600);
 
-  PumpControl::begin();
+    // SPI pins on RP2040
+    SPI.setRX(0);
+    SPI.setCS(1);
+    SPI.setSCK(2);
+    SPI.setTX(3);
+    SPI.begin();
 
-  Serial.println("Initializing LoRa module...");
-  if (!LoRa.begin(NSS_PIN, RESET_PIN, BUSY_PIN, IRQ_PIN, TXEN_PIN, RXEN_PIN))
-  {
-    Serial.println("Error: Unable to initialize LoRa module.");
-    while (1)
-      ;
-  }
+    // initialize LoRa module
+    Serial.println("Initializing LoRa module...");
+    if (!LoRa.begin(NSS_PIN, RESET_PIN, BUSY_PIN, IRQ_PIN, TXEN_PIN, RXEN_PIN)) {
+        Serial.println("Error: Unable to initialize LoRa module.");
+        while (1);
+    }
 
-  ds18b20.begin();
+    ds18b20.begin();
+    ReadSerialData(); // read sensor serial
 
-  getSensorData(); // Get sensor data once at startup
-
-  Serial.println("Set RF module to use TCXO as clock reference");
-  uint8_t dio3Voltage = SX126X_DIO3_OUTPUT_1_8;
-  uint32_t tcxoDelay = SX126X_TCXO_DELAY_10;
-  LoRa.setDio3TcxoCtrl(dio3Voltage, tcxoDelay);
-  LoRa.setFrequency(867300000);
-  LoRa.setTxPower(14, SX126X_TX_POWER_SX1262);
-  LoRa.setLoRaModulation(9, 125000, 5);
-  LoRa.setLoRaPacket(SX126X_HEADER_EXPLICIT, 8, 15, true);
-  LoRa.setSyncWord(0x34);
-
-  // Set RX gain to boosted gain
-  // Serial.println("Set RX gain to boosted gain");
-  // LoRa.setRxGain(SX126X_RX_GAIN_BOOSTED);
-
-  Serial.println("\n-- LORA TRANSMITTER READY --\n");
-
-  // Request for receiving new LoRa packet in RX continuous mode
-  LoRa.request(SX126X_RX_CONTINUOUS);
-
-  //Start IndicatorControl
-  IndicatorControl::begin();
-
-  // Initialize tasks
-  runner.init();
-  Serial.println("Initialized scheduler");
-  runner.addTask(T_print_sensor_data); // Add print sensor data task
-  runner.addTask(T_get_sensor_data);   // Add get sensor data task
-  runner.addTask(T_send_lora_data);    // Add send LoRa data task
-  T_get_sensor_data.enable();          // Enable get sensor data task
-  T_print_sensor_data.enable();        // Enable print sensor data task
-  T_send_lora_data.enable();           // Enable send LoRa data task
-  Serial.println("Enabled tasks");
-}
-
-unsigned long lastTransmitTime = 0;
-const unsigned long rxResumeDelay = 400; // ms after transmission to re-enable RX
-bool shouldResumeRx = false;
-
-void resetLoRaRequest()
-{
-  // Delay re-entering RX mode until tx is well clear
-  if (shouldResumeRx && millis() - lastTransmitTime >= rxResumeDelay)
-  {
+    // configure LoRa TX/RX
+    LoRa.setDio3TcxoCtrl(SX126X_DIO3_OUTPUT_1_8, SX126X_TCXO_DELAY_10);
+    LoRa.setFrequency(867300000);
+    LoRa.setTxPower(14, SX126X_TX_POWER_SX1262);
+    LoRa.setLoRaModulation(9, 125000, 5);
+    LoRa.setLoRaPacket(SX126X_HEADER_EXPLICIT, 8, 15, true);
+    LoRa.setSyncWord(0x34);
     LoRa.request(SX126X_RX_CONTINUOUS);
-    IndicatorControl::setLED(CRGB::Blue, 100);
-    shouldResumeRx = false;
-  }
+
+    Serial.println("-- LORA TRANSMITTER READY --");
+
+    // scheduler tasks
+    runner.init();
+    runner.addTask(T_get_sensor_data);
+    runner.addTask(T_print_sensor_data);
+    runner.addTask(T_send_lora_data);
+    T_get_sensor_data.enable();
+    T_print_sensor_data.enable();
+    T_send_lora_data.enable();
+    Serial.println("Tasks enabled");
+    IndicatorControl::Running();   // start in “running” (blinking) mode
 }
 
-void sendLoRaData()
-{
-  if (!dataWasMeasured)
-  {
-    IndicatorControl::setLED(CRGB::Red, 200);
-    return;
-  }
-
-  IndicatorControl::setLED(CRGB::Green, 200);
-  dataWasMeasured = false;
-  Serial.println("Sending LoRa Data...");
-
-  currentPacketID++;
-  // if the current packet ID is maxed out, reset it to 1
-  if (currentPacketID == 255)
-  {
-    currentPacketID = 1;
-  }
-
-  LocalDataStruct.packetID = currentPacketID;
-  LocalDataStruct.receiverID = secondNodeID; // Set receiver ID to second node
-  LocalDataStruct.updateCRC();            // Calculate CRC for the packet
-  LoRa.beginPacket();
-  LORA_WRITE_NUM_WRAPPED(myID); // Write sender ID
-  LoRa.write((uint8_t *)&LocalDataStruct, sizeof(LocalDataStruct));
-  LoRa.endPacket();
-  LoRa.wait();
-  LoRa.purge();
-  bitWrite(LocalDataStruct.flags, 7, BIT_OFF); // Bit 0: stop filling command
-
-  //  //print raw datapacket in hex make it print all even the 0 aka 0A instead of A
-  //  for (uint8_t i = 0; i < sizeof(LocalDataStruct); i++)
-  //  {
-  //    uint8_t val = ((uint8_t *)&LocalDataStruct)[i];
-  //    if (val < 0x10) Serial.print("0");  // Add leading zero if needed
-  //    Serial.print(val, HEX);
-  //  }
-  //  Serial.println();
-
-  // Packet sent successfully, turn LED green for 1 second
-  IndicatorControl::setLED(CRGB::Green, 1000);
-
-  // Delay RX re-entry
-  lastTransmitTime = millis();
-  shouldResumeRx = true;
+void loop() {
+    //IndicatorControl::setMode(IndicatorControl::RUNNING);
+    ReadSerialData();                     // read sensor serial
+    ReadMainSerialData();                 // read USB-serial commands
+    readLoraPacket();                     // handle inbound LoRa
+    PumpControl::update(LocalDataStruct); // update pump logic + packet.status
+    // push updated threshold into indicator each cycle
+    IndicatorControl::setThreshold(PumpControl::getWaterLevelThreshold());
+    IndicatorControl::update(LocalDataStruct); // LED indicator
+    runner.execute();                          // run scheduled tasks
+    resetLoRaRequest();                        // re-enter RX if needed
+    // only write back if either field actually changed
+    StorageConfig::saveIfChanged(LocalDataStruct.status, PumpControl::getWaterLevelThreshold());
 }
 
-void printByteBinary(uint8_t val)
-{
-  for (int8_t i = 7; i >= 0; i--)
-  {
-    Serial.print(bitRead(val, i));
-  }
-  Serial.println();
-}
-
-void resetMySerial()
-{
-  mySerial.end();                   // End the current SoftwareSerial instance
-  delay(100);                       // Small delay before reinitializing
-  mySerial.begin(9600);             // Reinitialize mySerial
-  lastSerialReceiveTime = millis(); // Reset the last received time
-  Serial.println("mySerial has been reset.");
-}
-
-// funtion to print the datapacket received in human readable format
-void printDataPacket(const DataPacket &packet)
-{
-  Serial.println("===== Data Packet =====");
-  Serial.print("Debug ID: ");
-  Serial.println(random(0, 100)); // Random debug ID for testing
-
-  Serial.print("Receiver ID: ");
-  Serial.println(packet.receiverID);
-
-  Serial.print("Flags: B");
-  printByteBinary(packet.flags);
-
-  Serial.print("Temperature 1: ");
-  Serial.println(packet.temperature[0]);
-  Serial.print("Temperature 2: ");
-  Serial.println(packet.temperature[1]);
-
-  Serial.print("Water Level: ");
-  Serial.println(packet.waterLevel);
-
-  Serial.print("IO Output: B");
-  printByteBinary(packet.IO_O);
-
-  Serial.print("Packet ID: ");
-  Serial.println(packet.packetID);
-
-  Serial.println("================================");
-}
-
-
-
-// Main loop
-void loop()
-{
-  ReadSerialData(); // Read data from mySerial
-  PumpControl::update(LocalDataStruct); // Check buttons using AceButton
-  IndicatorControl::update();           // Update LED state
-
-  runner.execute(); // Execute tasks
-
-  readLoraPacket(); // Read LoRa packet
-
-  resetLoRaRequest(); // Reset LoRa request to receive new packets
-}
-
-
-void processSerialInput(String data)
-{
-  int commaIndex = data.indexOf(',');
-  if (commaIndex != -1)
-  {
-    String levelStr = data.substring(0, commaIndex);
-    String ntcStr = data.substring(commaIndex + 1);
-
-    waterLevelSerial = levelStr.toInt();
-    TemperatureSerial = ntcStr.toInt();
-  }
-}
-void ReadSerialData()
-{
-  // Check if data is available on mySerial
-  while (mySerial.available())
-  {
-    char ch = mySerial.read();
-    if (ch == '\n')
-    {
-      processSerialInput(inputString);
-      inputString = "";                 // Clear for next read
-      lastSerialReceiveTime = millis(); // Update the last received time
+// ——————————————————————————————————
+// 5) SERIAL COLLECTION (external sensors)
+// ——————————————————————————————————
+void ReadSerialData() {
+    while (mySerial.available()) {
+        char ch = mySerial.read();
+        // ignore stray '\n' or '\r' in the middle
+        if (ch == '\n' || ch == '\r') {
+            if (inputString.length() > 0) {
+                processSerialInput(inputString);
+                inputString = "";
+                lastSerialReceiveTime = millis();
+            }
+        } else {
+            inputString += ch;
+        }
     }
-    else
-    {
-      inputString += ch;
-    }
-  }
 
-  // Check for serial timeout
-  if (millis() - lastSerialReceiveTime > serialTimeout)
-  {
-    Serial.println("Warning: mySerial is stuck. Attempting to reset...");
-    resetMySerial();
-  }
+    if (millis() - lastSerialReceiveTime > serialTimeout) {
+        resetMySerial();
+    }
+}
+const float MID_READING = 827.0; // ADC value that equals 21 °C
+const float MID_TEMP = 21.0;     // °C at that midpoint reading
+const float SCALE = 0.1;         // °C per ADC step (tweak this)
+
+void processSerialInput(const String &data) {
+    // ---- 1) Print the raw line ----
+    // Serial.print(F("RAW Received: "));
+    // Serial.println(data);
+
+    // ---- 2) Split into fields ----
+    int i1 = data.indexOf(',');
+    int i2 = data.indexOf(',', i1 + 1);
+    int i3 = data.indexOf(',', i2 + 1);
+    if (i1 < 0 || i2 < 0 || i3 < 0) return; // malformed
+
+    // ---- 3) Parse raw integers ----
+    uint16_t dist_mm = data.substring(0, i1).toInt();
+    uint16_t t10 = data.substring(i1 + 1, i2).toInt();
+    uint16_t h10 = data.substring(i2 + 1, i3).toInt();
+    uint8_t status = data.substring(i3 + 1).toInt();
+    // ---- 4) Store into LocalDataStruct ----
+    LocalDataStruct.waterLevel = map(constrain(dist_mm, 0, 2000), 0, 2000, 255, 0);
+    LocalDataStruct.temperature[1] = (float(t10) / 10.0f) - 5.0f; // 5.0 offset for DS18B20
+    // LocalDataStruct.humidity       = float(h10) / 10.0f;
+    LocalDataStruct.status = status;
+    dataWasMeasured = true;
+
+    // ---- 5) Print formatted values ----
+    // Serial.print(F("DIST="));
+    // Serial.print(dist_mm);
+    // Serial.print(F(" mm  TEMP="));
+    // Serial.print(LocalDataStruct.temperature[1], 1);
+    ////Serial.print(F(" °C  HUM="));
+    ////Serial.print(LocalDataStruct.humidity, 1);
+    // Serial.print(F(" %  STATUS=0b"));
+    //// Print status as 4-bit binary:
+    // for (int bit = 3; bit >= 0; --bit) {
+    //   Serial.print( (status & (1 << bit)) ? '1' : '0' );
+    // }
+    // Serial.println();
 }
 
-// Function to read LoRa packet
-void readLoraPacket()
-{
-  if (LoRa.available())
-  {
-    static bool readData = true;
+void resetMySerial() {
+    mySerial.end();
+    delay(100);
+    mySerial.begin(9600);
+    lastSerialReceiveTime = millis();
+}
 
-    // Read header starting with '<' and ending with '>'
+// ——————————————————————————————————
+// 6) USB-SERIAL COMMANDS
+// ——————————————————————————————————
+void ReadMainSerialData() {
+    while (Serial.available()) {
+        char ch = (char)Serial.read();
+        if (ch == '\r' || ch == '\n') {
+            if (mainInputString.length()) {
+                processMainSerialInput(mainInputString);
+                mainInputString = "";
+            }
+        } else {
+            mainInputString += ch;
+        }
+    }
+}
+
+void processMainSerialInput(const String &cmd) {
+    String s = cmd;
+    s.trim();
+    s.toLowerCase();
+    if (s == "s") {
+        // print raw local data packet print leading zeros
+        Serial.print("LocalDataStruct: ");
+        for (size_t i = 0; i < sizeof(LocalDataStruct); ++i) {
+            if (i > 0) Serial.print(' ');
+            if (i < sizeof(LocalDataStruct) - 1) {
+                Serial.print(((uint8_t *)&LocalDataStruct)[i], HEX);
+            } else {
+                Serial.print(((uint8_t *)&LocalDataStruct)[i], DEC);
+            }
+        }
+        // Serial.printf("Pump1:%s Pump2:%s Auto:%s\n",
+        //               PumpControl::getPump1State() ? "ON" : "OFF",
+        //               PumpControl::getPump2State() ? "ON" : "OFF",
+        //               PumpControl::isAutoMode() ? "EN" : "OFF");
+        printDataPacket(LocalDataStruct);
+    } else if (s == "d") {
+        printSensorData();
+    } else if (s == "r") {
+        Serial.println("→ Resetting Pico now!");
+        delay(50);
+        watchdog_reboot(0, 0, 0);
+    } else if (s.startsWith("w")) {
+        int t = s.substring(1).toInt();
+        PumpControl::setWaterLevelThreshold(constrain(t, 0, 255));
+        Serial.printf("Threshold set to: %u\n", map(PumpControl::getWaterLevelThreshold(), 0, 255, 0, 2500));
+    } else if (s.startsWith("q")) {
+        int t = s.substring(1).toInt();
+        LocalDataStruct.waterLevel = constrain(t, 0, 255);
+        Serial.printf("Debug level set to: %u\n", map(LocalDataStruct.waterLevel, 0, 255, 0, 2500));
+    } else if (s == "p11") {
+        PumpControl::setPump1(true);
+    } else if (s == "p10") {
+        PumpControl::setPump1(false);
+    } else if (s == "p21") {
+        PumpControl::setPump2(true);
+    } else if (s == "p20") {
+        PumpControl::setPump2(false);
+    } else if (s == "auto on") {
+        PumpControl::setAutoMode(true);
+    } else if (s == "auto off") {
+        PumpControl::setAutoMode(false);
+    } else if (s == "auto toggle") {
+        PumpControl::toggleAutoMode();
+    } else {
+        Serial.print("Unknown cmd: ");
+        Serial.println(cmd);
+    }
+}
+
+// ——————————————————————————————————
+// 7) SENSOR TASKS
+// ——————————————————————————————————
+void getSensorData() {
+    // 1) no devices on the bus?
+     if (ds18b20.getDeviceCount() == 0) {
+         ds18b20.begin(); // re-scan & re-init the bus
+         LocalDataStruct.temperature[0] = 255;
+         dataWasMeasured = true;
+         return;
+     }
+    
+     // 2) ask for a new reading
+     ds18b20.requestTemperatures();
+     float temp = ds18b20.getTempCByIndex(0);
+    
+     // 3) check for errors (disconnected, NaN or out-of-range)
+     if (temp == DEVICE_DISCONNECTED_C || isnan(temp) || temp < -55.0f || temp > 125.0f) {
+         ds18b20.begin(); // reset the bus
+         LocalDataStruct.temperature[0] = DEVICE_DISCONNECTED_C;
+     } else {
+        LocalDataStruct.temperature[0] = temp;
+     }
+
+
+    dataWasMeasured = true;
+}
+
+void printSensorData() {
+    Serial.printf("T0=%.2f  T1=%.2f  WL=%u  WT=%u\n", LocalDataStruct.temperature[0], LocalDataStruct.temperature[1], LocalDataStruct.waterLevel,
+                  PumpControl::getWaterLevelThreshold());
+
+    const uint8_t *p = reinterpret_cast<const uint8_t *>(&LocalDataStruct);
+    size_t n = sizeof(LocalDataStruct);
+
+    Serial.print("LocalDataStruct: ");
+    for (size_t i = 0; i < n; ++i) {
+        if (i) Serial.print(' ');
+        if (i < n - 1) {
+            // %02X → two-digit hex, leading zero if needed
+            Serial.printf("%02X", p[i]);
+        } else {
+            // last byte in decimal
+            Serial.printf("%u", p[i]);
+        }
+    }
+    Serial.println();
+}
+
+// ——————————————————————————————————
+// 8) LoRa SEND / RECEIVE
+// ——————————————————————————————————
+void sendLoRaData() {
+    if (LoRa.available() || !dataWasMeasured) return;
+    dataWasMeasured = false;
+    IndicatorControl::Transmitting();
+
+
+    currentPacketID = (currentPacketID % 255) + 1;
+    LocalDataStruct.packetID = currentPacketID;
+    LocalDataStruct.receiverID = GatewayID;
+    LocalDataStruct.updateCRC8();
+
+    LoRa.beginPacket();
+    LORA_WRITE_NUM_WRAPPED(myID); // Write sender ID
+    LoRa.write((uint8_t *)&LocalDataStruct, sizeof(LocalDataStruct));
+    LoRa.endPacket();
+    LoRa.wait();
+    LoRa.purge();
+    LoRa.request(SX126X_RX_CONTINUOUS);
+}
+
+void readLoraPacket() {
+    if (!LoRa.available()) return;
+    IndicatorControl::Receiving();
+    Serial.println("Received LoRa packet...");
     String idString = "";
     char ch;
     bool headerStarted = false;
-
-    // Read until we find a full <ID> or timeout
     unsigned long start = millis();
-    while ((millis() - start) < 1000) // timeout after 1 sec
-    {
-      if (LoRa.available())
-      {
+    while (millis() - start < 1000) {
+        if (!LoRa.available()) continue;
         ch = LoRa.read();
-
-        if (ch == '<')
-        {
-          idString = ""; // Reset
-          headerStarted = true;
+        Serial.print(ch, HEX);
+        if (ch == '<') {
+            headerStarted = true;
+            idString = "";
+        } else if (ch == '>' && headerStarted) {
+            break;
+        } else if (headerStarted) {
+            idString += ch;
         }
-        else if (ch == '>' && headerStarted)
-        {
-          break; // End of header
-        }
-        else if (headerStarted)
-        {
-          idString += ch;
-        }
-      }
     }
 
-    // Convert to int
     int senderID = idString.toInt();
-    Serial.print("Parsed sender ID from header: ");
+    Serial.print("Parsed sender ID: ");
     Serial.println(senderID);
-
-    if (senderID == myID)
-    {
-      readData = false; // Ignore own packets
-      Serial.println("Received packet from own node, ignore.");
-      return; // Ignore own packets
-    }
-    else if (senderID == secondNodeID)
-    {
-      Serial.println("Received packet from second node, update acordingly.");
-    }
-    else if (senderID == GatewayID)
-    {
-      Serial.println("Received packet from gateway, update acordingly.");
+    if (senderID == myID) {
+        Serial.println("→ own packet, ignoring");
+        return;
+    } else if (senderID == secondNodeID) {
+        Serial.println("→ from second node");
+    } else if (senderID == GatewayID) {
+        do_processReceivedData = true;
+        Serial.println("→ from gateway");
     }
 
-    Serial.print("Remaining bytes after header: ");
+    Serial.print("Bytes left: ");
     Serial.println(LoRa.available());
+    if (LoRa.available() >= sizeof(DataPacket)) {
+        uint8_t buf[sizeof(DataPacket)];
+        for (size_t i = 0; i < sizeof(buf); ++i) buf[i] = LoRa.read();
 
-    // Now read the binary payload (DataPacket)
-    if (LoRa.available() >= sizeof(DataPacket) && readData)
-    {
-      uint8_t buffer[sizeof(DataPacket)];
-      for (uint8_t i = 0; i < sizeof(DataPacket); i++)
-      {
-        buffer[i] = LoRa.read();
-      }
+        // print raw bytes
+        for (auto b : buf) {
+            if (b < 0x10) Serial.print('0');
+            Serial.print(b, HEX);
+            Serial.print(' ');
+        }
+        Serial.println();
 
-      // Print raw data in HEX with leading zeros
-      for (uint8_t i = 0; i < sizeof(DataPacket); i++)
-      {
-        if (buffer[i] < 0x10)
-          Serial.print("0");
-        Serial.print(buffer[i], HEX);
-        Serial.print(" ");
-      }
-      Serial.println();
+        memcpy(&receivedData, buf, sizeof(receivedData));
+        Serial.print("RSSI: ");
+        Serial.println(LoRa.packetRssi());
+        Serial.print("SNR:  ");
+        Serial.println(LoRa.snr());
+        printDataPacket(receivedData);
+        if (receivedData.validateCRC8()) {
+            Serial.println("CRC OK");
+            processReceivedData();
+            
 
-      memcpy(&receivedData, buffer, sizeof(DataPacket));
-
-      Serial.print("RSSI: ");
-      Serial.println(LoRa.packetRssi());
-      Serial.print("SNR: ");
-      Serial.println(LoRa.snr());
-
-      printDataPacket(receivedData);
+        } else {
+            Serial.println("CRC ERROR!");
+        }
+    } else {
+        Serial.println("Not enough data for full DataPacket");
     }
-    else
-    {
-      Serial.println("Not enough data for full DataPacket");
+}
+
+void processReceivedData() {
+    // if(do_processReceivedData){
+    //   do_processReceivedData = false;
+    // Print all the status bits
+    Serial.println("Status Bits:");
+    Serial.print("AUTO_MODE: ");
+    Serial.println(receivedData.status & PacketFlags::AUTO_MODE ? "ON" : "OFF");
+    Serial.print("PUMP1: ");
+    Serial.println(receivedData.status & PacketFlags::PUMP1 ? "ON" : "OFF");
+    Serial.print("PUMP2: ");
+    Serial.println(receivedData.status & PacketFlags::PUMP2 ? "ON" : "OFF");
+    Serial.print("STOP_FILL: ");
+    Serial.println(receivedData.status & PacketFlags::STOP_FILL ? "ON" : "OFF");
+    Serial.print("START_FILL: ");
+    Serial.println(receivedData.status & PacketFlags::START_FILL ? "ON" : "OFF");
+    Serial.print("P1_COM: ");
+    Serial.println(receivedData.status & PacketFlags::P1_COM ? "ON" : "OFF");
+    Serial.print("P2_COM: ");
+    Serial.println(receivedData.status & PacketFlags::P2_COM ? "ON" : "OFF");
+    Serial.print("OVERRIDE_EN: ");
+    Serial.println(receivedData.status & PacketFlags::OVERRIDE_EN ? "ON" : "OFF");
+    Serial.print("ERROR_STATE: ");
+    Serial.println(receivedData.status & PacketFlags::ERROR_STATE ? "ON" : "OFF");
+    Serial.print("ERROR_CODE: ");
+    Serial.println(receivedData.status & PacketFlags::ERROR_CODE ? "ON" : "OFF");
+
+    if (receivedData.status & PacketFlags::P1_COM) {
+        Serial.println("→ Pump 1 command received");
+        PumpControl::setPump1(receivedData.status & PacketFlags::PUMP1);
     }
-  }
+    if (receivedData.status & PacketFlags::P2_COM) {
+        Serial.println("→ Pump 2 command received");
+        PumpControl::setPump2(receivedData.status & PacketFlags::PUMP2);
+    }
+    LocalDataStruct.status = receivedData.status & PacketFlags::OVERRIDE_EN;
+    if (receivedData.status & PacketFlags::OVERRIDE_EN) {
+        Serial.println("→ Auto mode command received");
+        PumpControl::setAutoMode(receivedData.status & PacketFlags::AUTO_MODE);
+    }
+
+    // }
+    // reserved for future use
 }
 
-void processReceivedData()
-{
-  // Process the received data here
-  // For example, you can control pumps or update local data structure
-  // based on the received packet
-  Serial.println("Processing received data...");
-  // Add your processing logic here
+void resetLoRaRequest() {
+    // ensure RX continuous after TX
+    static unsigned long lastTx = 0;
+    if (millis() - lastTx > 400) {
+        LoRa.request(SX126X_RX_CONTINUOUS);
+        lastTx = millis();
+    }
 }
 
-// Function to get sensor data Task Handled by TaskScheduler
-void getSensorData()
-{
-  IndicatorControl::setLED(CRGB::Red, 1000); // Turns LED red for 1000 milliseconds (1 second)
-
-  ds18b20.requestTemperatures();
-  float temp = ds18b20.getTempCByIndex(0); // Read first (and only) sensor
-
-  // Update sensor struct
-  LocalDataStruct.temperature[0] = temp;
-  LocalDataStruct.temperature[1] = (1000 - TemperatureSerial) * (50.0 / 400.0); // (maxRaw - raw) * (range / span); // Map raw to 0–50 °C; // Use the value from the serial input
-  LocalDataStruct.waterLevel = waterLevelSerial;                                // Use the value from the serial input
-  printDataPacket(LocalDataStruct);
-  dataWasMeasured = true;
+// ——————————————————————————————————
+// 9) UTILITY PRINT FUNCTIONS
+// ——————————————————————————————————
+void printByteBinary(uint8_t val) {
+    for (int8_t i = 7; i >= 0; --i) Serial.print(bitRead(val, i));
 }
 
-// Print sensor data to serial Task Handled by TaskScheduler
-void printSensorData()
-{
-  // setLEDBlink(CRGB::OrangeRed, 2000, 500, 6); // Blink blue for a total of 2000 ms, with 250 ms interval, 3 full blinks
+void printDataPacket(const DataPacket &p) {
+    Serial.println("===== Data Packet =====");
+    Serial.print("Receiver ID: 0x");
+    if (p.receiverID < 0x10) Serial.print('0');
+    Serial.println(p.receiverID, HEX);
 
-  //printDataPacket(LocalDataStruct);
+    Serial.print("Status: B");
+    printByteBinary(p.status);
+
+    Serial.print("Packet ID: ");
+    Serial.println(p.packetID);
+    Serial.print("Water Lvl: ");
+    Serial.println(map(p.waterLevel, 0, 255, 0, 2500));
+    Serial.print("Water Lvl RAW: ");
+    Serial.println(p.waterLevel);
+    Serial.print("Temp[0]:   ");
+    Serial.println(p.temperature[0]);
+    Serial.print("Temp[1]:   ");
+    Serial.println(p.temperature[1]);
+
+    Serial.print("CRC8: 0x");
+    if (p.crc8 < 0x10) Serial.print('0');
+    Serial.println(p.crc8, HEX);
+    Serial.println("=======================\n");
 }
+
+// ——————————————————————————————————
+// 10) UNUSED / PLACEHOLDERS
+// ——————————————————————————————————

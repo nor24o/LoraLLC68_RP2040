@@ -1,0 +1,22 @@
+# .clang-format (at your repo’s root)
+BasedOnStyle:  Google    # or LLVM, WebKit, Mozilla, Chromium…
+ColumnLimit:    170         # “0” means “never break lines”
+
+
+# ─── Indentation & tabs ─────────────────────────────────────────────────
+IndentWidth:           4    # spaces per indent level
+TabWidth:              4    # how wide a “\t” counts as
+UseTab:                Never  # use spaces instead of tabs
+
+# ─── Spaces around operators ────────────────────────────────────────────
+SpaceBeforeAssignmentOperators: true  # e.g. “a = b;”
+SpaceBeforeParens: ControlStatements  # adds space in “if (…)", “while (…)", etc.
+SpaceInEmptyParentheses: false        # “foo();” vs “foo( );”
+SpacesInParentheses:    false         # “f(x,y)” vs “f( x, y )”
+SpacesInContainerLiterals: true       # “{ 1, 2, 3 }” vs “{1,2,3}”
+SpacesInCStyleCastParentheses: false  # “(int)x” vs “( int ) x”
+
+# ─── Other miscellaneous spacing ────────────────────────────────────────
+SpacesBeforeTrailingComments: 1       # “code;  // comment”
+SpaceAfterCStyleCast:       false     # “(int)x” vs “(int) x”
+SpaceAfterTemplateKeyword:  false     # “template< class T >” control
