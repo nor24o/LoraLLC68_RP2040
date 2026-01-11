@@ -16,14 +16,13 @@ inline constexpr int EEPROM_ADDR = 0;
 #pragma pack(push, 1)
 struct Config {
     uint16_t status;
-    uint8_t threshold;
     uint8_t crc8;
 
     uint8_t calculateCRC() const {
         uint8_t crc = 0;
         const uint8_t* p = reinterpret_cast<const uint8_t*>(this);
         // cover status + threshold (3 bytes)
-        for (size_t i = 0; i < sizeof(status) + sizeof(threshold); ++i) {
+        for (size_t i = 0; i < sizeof(status); ++i) {
             crc ^= p[i];
             for (int b = 0; b < 8; ++b) {
                 crc = (crc & 0x80) ? (crc << 1) ^ 0x31 : (crc << 1);
@@ -48,7 +47,6 @@ inline void begin() {
     if (!_cfg.validateCRC()) {
         Serial.println("No valid config → loading defaults");
         _cfg.status = PacketFlags::AUTO_MODE;
-        _cfg.threshold = 128; // your default threshold
         _cfg.updateCRC();
         EEPROM.put(EEPROM_ADDR, _cfg);
         EEPROM.commit(); // writes back, returns bool if you care :contentReference[oaicite:3]{index=3}
@@ -57,13 +55,11 @@ inline void begin() {
 
 // —2) accessors for your two values—
 inline uint16_t loadStatus() { return _cfg.status; }
-inline uint8_t loadThreshold() { return _cfg.threshold; }
 
 // —3) whenever either field may have changed—
-inline void saveIfChanged(uint16_t newStatus, uint8_t newThreshold) {
-    if (newStatus != _cfg.status || newThreshold != _cfg.threshold) {
+inline void saveIfChanged(uint16_t newStatus) {
+    if (newStatus != _cfg.status) {
         _cfg.status = newStatus;
-        _cfg.threshold = newThreshold;
         _cfg.updateCRC();
         EEPROM.put(EEPROM_ADDR, _cfg);
         if (EEPROM.commit()) {

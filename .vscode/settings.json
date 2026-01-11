@@ -1,0 +1,14 @@
+{
+  // 1. Let PlatformIO drive the C/C++ extension’s config
+  "C_Cpp.default.configurationProvider": "platformio.platformio-extension",
+
+  // 2. Use the full IntelliSense engine (not the Tag Parser)
+  "C_Cpp.intelliSenseEngine": "Default",
+  "C_Cpp.intelliSenseEngineFallback": "Disabled",
+
+  // 3. Turn on red/green squiggles for compile errors
+  "C_Cpp.errorSquiggles": "Enabled",
+
+  // 4. Make sure auto-complete is powered by the semantic engine
+  "C_Cpp.autocomplete": "Default"
+}

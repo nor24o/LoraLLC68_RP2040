@@ -7,13 +7,19 @@
 // pin assignments
 #define DS18B20_PIN 7
 #define LED_PIN 15
+#define BOARD_LED_PIN 16
+
 #define PUMP1_PIN 12
 #define PUMP2_PIN 11
+
 #define BTN_AUTO 10
 #define BTN_PUMP1 8
 #define BTN_PUMP2 9
-#define SECOND_SERIAL_RX 13
-#define SECOND_SERIAL_TX 14
+
+// water level inputs 0..2
+#define WL_IN_0 13
+#define WL_IN_1 14
+#define WL_IN_2 26
 
 // wrap LoRa sender ID in “<ID>”
 #define LORA_WRITE_NUM_WRAPPED(id)                             \
@@ -35,13 +41,13 @@
 #include <FastLED.h>
 #include <OneWire.h>
 #include <SX126x.h>
-#include <SoftwareSerial.h>
 #include <TaskScheduler.h>
 #include <math.h> // for log()
 
-#include "IndicatControll.hpp"
+#include "IndicatorControll.hpp"
+#include "PumpControl.hpp"
 #include "StorageConfig.hpp"
-#include "controller.hpp"
+#include "WaterLevel.hpp"
 #include "hardware/watchdog.h"
 #include "structures.h"
 
@@ -54,14 +60,14 @@ const int8_t TXEN_PIN = -1;
 const int8_t RXEN_PIN = -1;
 
 // node IDs
-#define myID 101
-#define secondNodeID 102
+#define myID 111
+#define secondNodeID 112
 #define GatewayID 100
 
 // Task intervals (ms)
-#define getSensorDataInterval 10000
-#define printDataInterval 30000
-#define sendLoRaDataInterval 20000
+#define getSensorDataInterval 5000
+#define printDataInterval 6000
+#define sendLoRaDataInterval 6000
 
 // ——————————————————————————————————
 // 2) FORWARD DECLARATIONS
@@ -91,7 +97,7 @@ void printDataPacket(const DataPacket &packet);
 // 3) GLOBAL OBJECTS & STATE
 // ——————————————————————————————————
 SX126x LoRa;
-SoftwareSerial mySerial(SECOND_SERIAL_RX, SECOND_SERIAL_TX);
+bool LoraInitialized = true;
 
 OneWire oneWire(DS18B20_PIN);
 DallasTemperature ds18b20(&oneWire);
@@ -126,22 +132,31 @@ Task T_send_lora_data(sendLoRaDataInterval, TASK_FOREVER, &sendLoRaData);
 void setup() {
     // USB-serial
     Serial.begin(115200);
-    // while (!Serial)
-    //   ; // wait for USB
+    // ——— wait for up to 5 s for Serial to connect ———
+    const unsigned long SERIAL_TIMEOUT_MS = 2000;
+    unsigned long start = millis();
+    while (!Serial && (millis() - start < SERIAL_TIMEOUT_MS)) {
+        delay(10); // avoid busy-spin
+    }
+
+    if (Serial) {
+        Serial.println(F("Serial connected."));
+    } else {
+        // timed-out, serial never connected
+        // you can blink an LED here or just carry on silently
+    }
+
+    WaterLevel::begin(WL_IN_0, WL_IN_1, WL_IN_2); // bottom→pin2, middle→pin3, top→pin4
 
     // 1) initialize & load stored status + threshold
     StorageConfig::begin();
     LocalDataStruct.status = StorageConfig::loadStatus();
-    PumpControl::setWaterLevelThreshold(StorageConfig::loadThreshold());
 
     // initialize pumps & buttons
     PumpControl::begin();
     PumpControl::updatelocalstates(LocalDataStruct);
     // initialize LED indicator
     IndicatorControl::begin();
-
-    // serial for external sensors
-    mySerial.begin(9600);
 
     // SPI pins on RP2040
     SPI.setRX(0);
@@ -154,123 +169,56 @@ void setup() {
     Serial.println("Initializing LoRa module...");
     if (!LoRa.begin(NSS_PIN, RESET_PIN, BUSY_PIN, IRQ_PIN, TXEN_PIN, RXEN_PIN)) {
         Serial.println("Error: Unable to initialize LoRa module.");
-        while (1);
+        LoraInitialized = false;
     }
 
     ds18b20.begin();
-    ReadSerialData(); // read sensor serial
-
-    // configure LoRa TX/RX
-    LoRa.setDio3TcxoCtrl(SX126X_DIO3_OUTPUT_1_8, SX126X_TCXO_DELAY_10);
-    LoRa.setFrequency(867300000);
-    LoRa.setTxPower(14, SX126X_TX_POWER_SX1262);
-    LoRa.setLoRaModulation(9, 125000, 5);
-    LoRa.setLoRaPacket(SX126X_HEADER_EXPLICIT, 8, 15, true);
-    LoRa.setSyncWord(0x34);
-    LoRa.request(SX126X_RX_CONTINUOUS);
-
-    Serial.println("-- LORA TRANSMITTER READY --");
+    if (LoraInitialized) {
+        // configure LoRa TX/RX
+        LoRa.setDio3TcxoCtrl(SX126X_DIO3_OUTPUT_1_8, SX126X_TCXO_DELAY_10);
+        LoRa.setFrequency(868100000);
+        LoRa.setTxPower(14, SX126X_TX_POWER_SX1262);
+        LoRa.setLoRaModulation(9, 125000, 5);
+        LoRa.setLoRaPacket(SX126X_HEADER_EXPLICIT, 8, 255, true, false);
+        LoRa.setSyncWord(0x34);
+        LoRa.request(SX126X_RX_CONTINUOUS);
+        Serial.println("-- LORA TRANSMITTER READY --");
+    } else {
+        Serial.println("LoRa module not initialized, skipping LoRa setup.");
+    }
 
     // scheduler tasks
     runner.init();
     runner.addTask(T_get_sensor_data);
     runner.addTask(T_print_sensor_data);
     runner.addTask(T_send_lora_data);
-    T_get_sensor_data.enable();
+    T_get_sensor_data.enableDelayed(0);
     T_print_sensor_data.enable();
     T_send_lora_data.enable();
     Serial.println("Tasks enabled");
-    IndicatorControl::Running();   // start in “running” (blinking) mode
+    IndicatorControl::Running(); // start in “running” (blinking) mode
 }
 
 void loop() {
-    //IndicatorControl::setMode(IndicatorControl::RUNNING);
-    ReadSerialData();                     // read sensor serial
+    runner.execute(); // run scheduled tasks
+
     ReadMainSerialData();                 // read USB-serial commands
     readLoraPacket();                     // handle inbound LoRa
     PumpControl::update(LocalDataStruct); // update pump logic + packet.status
     // push updated threshold into indicator each cycle
-    IndicatorControl::setThreshold(PumpControl::getWaterLevelThreshold());
+    // IndicatorControl::setThreshold(PumpControl::getWaterLevelThreshold());
     IndicatorControl::update(LocalDataStruct); // LED indicator
-    runner.execute();                          // run scheduled tasks
     resetLoRaRequest();                        // re-enter RX if needed
     // only write back if either field actually changed
-    StorageConfig::saveIfChanged(LocalDataStruct.status, PumpControl::getWaterLevelThreshold());
+    StorageConfig::saveIfChanged(LocalDataStruct.status);
 }
 
 // ——————————————————————————————————
-// 5) SERIAL COLLECTION (external sensors)
+// 11) FUNCTION TO READ WATER LEVEL INPUT AND PROCESS WATER LEVEL
 // ——————————————————————————————————
-void ReadSerialData() {
-    while (mySerial.available()) {
-        char ch = mySerial.read();
-        // ignore stray '\n' or '\r' in the middle
-        if (ch == '\n' || ch == '\r') {
-            if (inputString.length() > 0) {
-                processSerialInput(inputString);
-                inputString = "";
-                lastSerialReceiveTime = millis();
-            }
-        } else {
-            inputString += ch;
-        }
-    }
-
-    if (millis() - lastSerialReceiveTime > serialTimeout) {
-        resetMySerial();
-    }
-}
-const float MID_READING = 827.0; // ADC value that equals 21 °C
-const float MID_TEMP = 21.0;     // °C at that midpoint reading
-const float SCALE = 0.1;         // °C per ADC step (tweak this)
-
-void processSerialInput(const String &data) {
-    // ---- 1) Print the raw line ----
-    // Serial.print(F("RAW Received: "));
-    // Serial.println(data);
-
-    // ---- 2) Split into fields ----
-    int i1 = data.indexOf(',');
-    int i2 = data.indexOf(',', i1 + 1);
-    int i3 = data.indexOf(',', i2 + 1);
-    if (i1 < 0 || i2 < 0 || i3 < 0) return; // malformed
-
-    // ---- 3) Parse raw integers ----
-    uint16_t dist_mm = data.substring(0, i1).toInt();
-    uint16_t t10 = data.substring(i1 + 1, i2).toInt();
-    uint16_t h10 = data.substring(i2 + 1, i3).toInt();
-    uint8_t status = data.substring(i3 + 1).toInt();
-    // ---- 4) Store into LocalDataStruct ----
-    LocalDataStruct.waterLevel = map(constrain(dist_mm, 0, 2000), 0, 2000, 255, 0);
-    LocalDataStruct.temperature[1] = (float(t10) / 10.0f) - 5.0f; // 5.0 offset for DS18B20
-    // LocalDataStruct.humidity       = float(h10) / 10.0f;
-    LocalDataStruct.status = status;
-    dataWasMeasured = true;
-
-    // ---- 5) Print formatted values ----
-    // Serial.print(F("DIST="));
-    // Serial.print(dist_mm);
-    // Serial.print(F(" mm  TEMP="));
-    // Serial.print(LocalDataStruct.temperature[1], 1);
-    ////Serial.print(F(" °C  HUM="));
-    ////Serial.print(LocalDataStruct.humidity, 1);
-    // Serial.print(F(" %  STATUS=0b"));
-    //// Print status as 4-bit binary:
-    // for (int bit = 3; bit >= 0; --bit) {
-    //   Serial.print( (status & (1 << bit)) ? '1' : '0' );
-    // }
-    // Serial.println();
-}
-
-void resetMySerial() {
-    mySerial.end();
-    delay(100);
-    mySerial.begin(9600);
-    lastSerialReceiveTime = millis();
-}
 
 // ——————————————————————————————————
-// 6) USB-SERIAL COMMANDS
+// 6) USB-SERIAL COMMANDS READ/PROCESSING
 // ——————————————————————————————————
 void ReadMainSerialData() {
     while (Serial.available()) {
@@ -312,14 +260,6 @@ void processMainSerialInput(const String &cmd) {
         Serial.println("→ Resetting Pico now!");
         delay(50);
         watchdog_reboot(0, 0, 0);
-    } else if (s.startsWith("w")) {
-        int t = s.substring(1).toInt();
-        PumpControl::setWaterLevelThreshold(constrain(t, 0, 255));
-        Serial.printf("Threshold set to: %u\n", map(PumpControl::getWaterLevelThreshold(), 0, 255, 0, 2500));
-    } else if (s.startsWith("q")) {
-        int t = s.substring(1).toInt();
-        LocalDataStruct.waterLevel = constrain(t, 0, 255);
-        Serial.printf("Debug level set to: %u\n", map(LocalDataStruct.waterLevel, 0, 255, 0, 2500));
     } else if (s == "p11") {
         PumpControl::setPump1(true);
     } else if (s == "p10") {
@@ -343,66 +283,120 @@ void processMainSerialInput(const String &cmd) {
 // ——————————————————————————————————
 // 7) SENSOR TASKS
 // ——————————————————————————————————
-void getSensorData() {
-    // 1) no devices on the bus?
-     if (ds18b20.getDeviceCount() == 0) {
-         ds18b20.begin(); // re-scan & re-init the bus
-         LocalDataStruct.temperature[0] = 255;
-         dataWasMeasured = true;
-         return;
-     }
-    
-     // 2) ask for a new reading
-     ds18b20.requestTemperatures();
-     float temp = ds18b20.getTempCByIndex(0);
-    
-     // 3) check for errors (disconnected, NaN or out-of-range)
-     if (temp == DEVICE_DISCONNECTED_C || isnan(temp) || temp < -55.0f || temp > 125.0f) {
-         ds18b20.begin(); // reset the bus
-         LocalDataStruct.temperature[0] = DEVICE_DISCONNECTED_C;
-     } else {
-        LocalDataStruct.temperature[0] = temp;
-     }
 
+    // 2) stash the raw byte (bits 0–1 = level, bit 2 = abnormal)
+    uint8_t waterStatus = 0;
+
+    // 3) split it out if you want:
+    uint8_t lvl = 0;        // 0..3
+    bool isAbnorm = false; // true/false
+
+void getSensorData() {
+    // 1) refresh the sensor state
+    WaterLevel::update();
+
+    // 2) stash the raw byte (bits 0–1 = level, bit 2 = abnormal)
+    waterStatus = WaterLevel::waterState;
+
+    // 3) split it out if you want:
+    lvl = waterStatus & WaterLevel::LEVEL_MASK;        // 0..3
+    isAbnorm = (waterStatus & WaterLevel::ABNORMAL_FLAG); // true/false
+
+    LocalDataStruct.waterLevel = lvl;
+    // store the isAbnorm flag in the status and bit ERROR_STATE
+    if (isAbnorm) {
+        LocalDataStruct.status |= PacketFlags::ERROR_STATE;
+    } else {
+        LocalDataStruct.status &= ~PacketFlags::ERROR_STATE;
+    }
+
+    Serial.println();
+
+    // 1) no devices on the bus?
+    if (ds18b20.getDeviceCount() == 0) {
+        ds18b20.begin(); // re-scan & re-init the bus
+        LocalDataStruct.temperature = 255;
+        dataWasMeasured = true;
+        return;
+    }
+
+    // 2) ask for a new reading
+    ds18b20.requestTemperatures();
+    float temp = ds18b20.getTempCByIndex(0);
+
+    // 3) check for errors (disconnected, NaN or out-of-range)
+    if (temp == DEVICE_DISCONNECTED_C || isnan(temp) || temp < -55.0f || temp > 125.0f) {
+        ds18b20.begin(); // reset the bus
+        LocalDataStruct.temperature = DEVICE_DISCONNECTED_C;
+    } else {
+        LocalDataStruct.temperature = temp;
+    }
 
     dataWasMeasured = true;
 }
 
 void printSensorData() {
-    Serial.printf("T0=%.2f  T1=%.2f  WL=%u  WT=%u\n", LocalDataStruct.temperature[0], LocalDataStruct.temperature[1], LocalDataStruct.waterLevel,
-                  PumpControl::getWaterLevelThreshold());
+    // ——— 1) Human-readable values ———
+    Serial.print(F("T="));
+    Serial.print(LocalDataStruct.temperature, 2);
+    Serial.print(F(" WL="));
+    Serial.println(LocalDataStruct.waterLevel);
 
-    const uint8_t *p = reinterpret_cast<const uint8_t *>(&LocalDataStruct);
+    // ——— 2) Raw struct bytes as hex ———
+    const uint8_t* p = reinterpret_cast<const uint8_t*>(&LocalDataStruct);
     size_t n = sizeof(LocalDataStruct);
 
-    Serial.print("LocalDataStruct: ");
+    Serial.print(F("LocalDataStruct:"));
     for (size_t i = 0; i < n; ++i) {
-        if (i) Serial.print(' ');
-        if (i < n - 1) {
-            // %02X → two-digit hex, leading zero if needed
-            Serial.printf("%02X", p[i]);
-        } else {
-            // last byte in decimal
-            Serial.printf("%u", p[i]);
-        }
+        Serial.print(' ');
+        // two-digit hex, leading zero if needed
+        if (p[i] < 0x10) Serial.print('0');
+        Serial.print(p[i], HEX);
     }
     Serial.println();
+
+    // ——— 3) Water-level description ———
+    Serial.print(F("Level: "));
+    switch (WaterLevel::level()) {
+      case WaterLevel::LEVEL_EMPTY: Serial.println(F("Empty"));   break;
+      case WaterLevel::LEVEL_LOW:   Serial.println(F("Low"));     break;
+      case WaterLevel::LEVEL_MID:   Serial.println(F("Mid"));     break;
+      case WaterLevel::LEVEL_FULL:  Serial.println(F("Full"));    break;
+      default:                      Serial.println(F("Unknown")); break;
+    }
+
+    // ——— 4) Abnormal flag ———
+    if (WaterLevel::abnormal()) {
+        Serial.println(F("⚠️ Abnormal!"));
+    }
+
+    // ——— 5) Status bits ———
+    Serial.print(F("Status: "));
+    printByteBinary(LocalDataStruct.status);
+    Serial.println();
 }
+
 
 // ——————————————————————————————————
 // 8) LoRa SEND / RECEIVE
 // ——————————————————————————————————
 void sendLoRaData() {
-    if (LoRa.available() || !dataWasMeasured) return;
-    dataWasMeasured = false;
-    IndicatorControl::Transmitting();
 
-
+    Serial.println("Sending LoRa packet...Thread");
     currentPacketID = (currentPacketID % 255) + 1;
     LocalDataStruct.packetID = currentPacketID;
     LocalDataStruct.receiverID = GatewayID;
+    //for test 
+    LocalDataStruct.status &= ~(PacketFlags::OTHER_STATION_PUMP);
+
+
+    //generate CRC8
     LocalDataStruct.updateCRC8();
 
+
+    if (!LoraInitialized) return;
+    if (LoRa.available() || !dataWasMeasured) return;
+    IndicatorControl::Transmitting();
     LoRa.beginPacket();
     LORA_WRITE_NUM_WRAPPED(myID); // Write sender ID
     LoRa.write((uint8_t *)&LocalDataStruct, sizeof(LocalDataStruct));
@@ -410,9 +404,11 @@ void sendLoRaData() {
     LoRa.wait();
     LoRa.purge();
     LoRa.request(SX126X_RX_CONTINUOUS);
+    dataWasMeasured = false;
 }
 
 void readLoraPacket() {
+    if (!LoraInitialized) return;
     if (!LoRa.available()) return;
     IndicatorControl::Receiving();
     Serial.println("Received LoRa packet...");
@@ -470,7 +466,6 @@ void readLoraPacket() {
         if (receivedData.validateCRC8()) {
             Serial.println("CRC OK");
             processReceivedData();
-            
 
         } else {
             Serial.println("CRC ERROR!");
@@ -492,9 +487,9 @@ void processReceivedData() {
     Serial.print("PUMP2: ");
     Serial.println(receivedData.status & PacketFlags::PUMP2 ? "ON" : "OFF");
     Serial.print("STOP_FILL: ");
-    Serial.println(receivedData.status & PacketFlags::STOP_FILL ? "ON" : "OFF");
+    Serial.println(receivedData.status & PacketFlags::OTHER_STATION_PUMP ? "ON" : "OFF");
     Serial.print("START_FILL: ");
-    Serial.println(receivedData.status & PacketFlags::START_FILL ? "ON" : "OFF");
+    Serial.println(receivedData.status & PacketFlags::OTHER_STATION_STARTSTOP_FILL ? "ON" : "OFF");
     Serial.print("P1_COM: ");
     Serial.println(receivedData.status & PacketFlags::P1_COM ? "ON" : "OFF");
     Serial.print("P2_COM: ");
@@ -551,21 +546,13 @@ void printDataPacket(const DataPacket &p) {
 
     Serial.print("Packet ID: ");
     Serial.println(p.packetID);
-    Serial.print("Water Lvl: ");
-    Serial.println(map(p.waterLevel, 0, 255, 0, 2500));
-    Serial.print("Water Lvl RAW: ");
+    Serial.print("WL: ");
     Serial.println(p.waterLevel);
-    Serial.print("Temp[0]:   ");
-    Serial.println(p.temperature[0]);
-    Serial.print("Temp[1]:   ");
-    Serial.println(p.temperature[1]);
+    Serial.print("T:   ");
+    Serial.println(p.temperature);
 
     Serial.print("CRC8: 0x");
     if (p.crc8 < 0x10) Serial.print('0');
     Serial.println(p.crc8, HEX);
     Serial.println("=======================\n");
 }
-
-// ——————————————————————————————————
-// 10) UNUSED / PLACEHOLDERS
-// ——————————————————————————————————

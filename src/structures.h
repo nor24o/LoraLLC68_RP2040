@@ -20,13 +20,12 @@
 //   |      |      |       └─ waterLevel      = 0xFA   (250)
 //   |      |      └─ packetID         = 0x12   (18)
 //   |      └─ status_low   = 0x01    (AUTO_MODE bit set)
-//   |      └─ status_high  = 0xC1    (PUMP1 + PUMP2 + STOP_FILL bits in high byte)
+//   |      └─ status_high  = 0xC1    (PUMP1 + PUMP2 + OTHER_STAITON_PUMP bits in high byte)
 //   └─ receiverID        = 0x2A   (42)
 
 #pragma once
 #include <Arduino.h>
 
-#define NUM_ANALOG 2 // ← your number of temp sensors
 
 #pragma pack(push, 1)
 struct DataPacket {
@@ -34,7 +33,7 @@ struct DataPacket {
     uint16_t status;                 // 4-bit flags + 4-bit IO_O
     uint8_t packetID;                // 1 B
     uint8_t waterLevel;              // 1 B (0–255)
-    float temperature[NUM_ANALOG]; // 4 bytes * 2 = 8 bytes
+    float temperature; // 4 bytes * 2 = 8 bytes
     uint8_t crc8;                    // 1 B
 
     // —— CRC-8 (Dallas/Maxim, poly 0x31) ——
@@ -54,7 +53,7 @@ struct DataPacket {
     bool validateCRC8() const { return calculateCRC8() == crc8; }
 };
 #pragma pack(pop)
-static_assert(sizeof(DataPacket) == 6 + 4 * NUM_ANALOG, "Unexpected DataPacket size");
+static_assert(sizeof(DataPacket) == 6 + 4 , "Unexpected DataPacket size");
 
 // in structures.h / DataPacket.h:
 namespace PacketFlags {
@@ -65,8 +64,8 @@ static constexpr Flags ERROR_STATE = Flags(1) << 2;
 static constexpr Flags ERROR_CODE = Flags(1) << 3;
 static constexpr Flags PUMP1 = Flags(1) << 4;
 static constexpr Flags PUMP2 = Flags(1) << 5;
-static constexpr Flags STOP_FILL = Flags(1) << 6;
-static constexpr Flags START_FILL = Flags(1) << 7;
+static constexpr Flags OTHER_STATION_PUMP = Flags(1) << 6;
+static constexpr Flags OTHER_STATION_STARTSTOP_FILL = Flags(1) << 7;
 static constexpr Flags P1_COM = Flags(1) << 8;
 static constexpr Flags P2_COM = Flags(1) << 9;
 // bits 10–15 free

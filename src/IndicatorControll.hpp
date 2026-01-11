@@ -5,7 +5,7 @@
 #include <FastLED.h>
 
 #include "structures.h"
-
+#include "WaterLevel.hpp"
 // Change this if your LED strip is on a different pin:
 #ifndef LED_PIN
 #define LED_PIN 6
@@ -22,7 +22,6 @@ inline CRGB leds[NUM_LEDS];
 inline CRGB leds_board[1];
 
 // threshold below which we consider “low water”
-inline uint8_t waterLevelThreshold = 0;
 
 // flash state (unchanged)
 inline bool flashActive = false;
@@ -39,9 +38,6 @@ static constexpr unsigned long NORMAL_UPDATE_INTERVAL = 200;
 static constexpr unsigned long SLOW_BLINK_INTERVAL = 1000;
 
 inline unsigned long lastNormalUpdate = 0;
-
-/// Set the low‐water threshold (raw 0–255) before calling update()
-inline void setThreshold(uint8_t t) { waterLevelThreshold = t; }
 
 /// Power‐on test + brightness
 inline void begin() {
@@ -75,20 +71,20 @@ inline Mode currentMode = IDLE;
 inline bool blinkState = false;
 inline unsigned long blinkTS = 0;
 
-inline unsigned long modeTS     = 0;              // when we last changed mode
-inline unsigned long modeHold   = 0;              // how long to stay in TX/RX
+inline unsigned long modeTS = 0;   // when we last changed mode
+inline unsigned long modeHold = 0; // how long to stay in TX/RX
 static constexpr unsigned long TRANSMIT_HOLD = 200;
-static constexpr unsigned long RECEIVE_HOLD  = 800;
+static constexpr unsigned long RECEIVE_HOLD = 800;
 
 inline void setMode(Mode m, unsigned long holdMs = 0) {
-  currentMode = m;
-  modeTS      = millis();
-  modeHold    = holdMs;
-  // if you immediately go into RUNNING, reset its blink timer too:
-  if (m == RUNNING) {
-    blinkState = false;
-    blinkTS    = modeTS;
-  }
+    currentMode = m;
+    modeTS = millis();
+    modeHold = holdMs;
+    // if you immediately go into RUNNING, reset its blink timer too:
+    if (m == RUNNING) {
+        blinkState = false;
+        blinkTS = modeTS;
+    }
 }
 
 // 4) Call this at the top of your update() (or right before FastLED.show())
@@ -150,20 +146,20 @@ inline void update(DataPacket &data) {
     // compute how many LEDs (0..4) should be lit:
     // (unchanged static bins)
     uint8_t numLit;
-    if (data.waterLevel <waterLevelThreshold )
+    if (data.waterLevel == WaterLevel::LEVEL_EMPTY)
         numLit = 0;
-    else if (data.waterLevel < 32)
+    else if (data.waterLevel == WaterLevel::LEVEL_LOW)
         numLit = 1;
-    else if (data.waterLevel < 100)
+    else if (data.waterLevel == WaterLevel::LEVEL_LOW && WaterLevel::LEVEL_MID)
         numLit = 2;
-    else if (data.waterLevel < 170)
+    else if (data.waterLevel == WaterLevel::LEVEL_MID)
         numLit = 3;
-    else
+    else if (data.waterLevel == WaterLevel::LEVEL_FULL)
         numLit = WATER_BAR_LEDS;
 
     // determine “low‐water” using the shared threshold
-    bool lowWater = (data.waterLevel <= waterLevelThreshold);
-    bool HighWater = (data.waterLevel >= 215);
+    bool lowWater = (data.waterLevel == WaterLevel::LEVEL_EMPTY);
+    bool HighWater = (data.waterLevel == WaterLevel::LEVEL_FULL);
 
     // mode/pump flags
     bool autoMode = data.status & PacketFlags::AUTO_MODE;
