@@ -175,12 +175,14 @@ void setup() {
     ds18b20.begin();
     if (LoraInitialized) {
         // configure LoRa TX/RX
-        LoRa.setDio3TcxoCtrl(SX126X_DIO3_OUTPUT_1_8, SX126X_TCXO_DELAY_10);
+      // LoRa.setDio3TcxoCtrl(SX126X_DIO3_OUTPUT_1_8, SX126X_TCXO_DELAY_10);
+        LoRa.setRegulator(SX126X_REGULATOR_DC_DC); 
+        LoRa.setCurrentProtection(140); 
         LoRa.setFrequency(868100000);
         LoRa.setTxPower(14, SX126X_TX_POWER_SX1262);
         LoRa.setLoRaModulation(9, 125000, 5);
         LoRa.setLoRaPacket(SX126X_HEADER_EXPLICIT, 8, 255, true, false);
-        LoRa.setSyncWord(0x34);
+        LoRa.setSyncWord(0x12);
         LoRa.request(SX126X_RX_CONTINUOUS);
         Serial.println("-- LORA TRANSMITTER READY --");
     } else {
